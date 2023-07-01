@@ -1,0 +1,455 @@
+---
+title: "Razvoj modela za predviđanje rezultata kuglačkih utakmica"
+author: "Karlo Boroš"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(readxl)
+library(tidyr)
+library(ggplot2)
+library(googledrive)
+library(googlesheets4)
+library(gtools)
+#rm(list = ls())
+drive_auth()
+```
+
+
+**Učitavanje sa google sheetsa:**
+
+```{r}
+
+all_games <- read_sheet("https://docs.google.com/spreadsheets/d/1lXhSgBAsnoj5FIG9nI9uDRtZ-aS5yXFt9EPMGAzdFj0", sheet = "Utakmice")
+players <- read_sheet("https://docs.google.com/spreadsheets/d/1lXhSgBAsnoj5FIG9nI9uDRtZ-aS5yXFt9EPMGAzdFj0", sheet = "Igraci")
+teams <- read_sheet("https://docs.google.com/spreadsheets/d/1lXhSgBAsnoj5FIG9nI9uDRtZ-aS5yXFt9EPMGAzdFj0", sheet = "Ekipe")
+schedule <- read_sheet("https://docs.google.com/spreadsheets/d/1lXhSgBAsnoj5FIG9nI9uDRtZ-aS5yXFt9EPMGAzdFj0", sheet = "Raspored_sezona")
+#games
+#players
+#teams
+games <- all_games %>% filter(Sezona=="22/23")
+results <- left_join(games, players) %>% select(Datum, Igrač, Uk)
+
+```
+
+```{r}
+
+predictions <- function(games, players, teams, schedule, datum, bowling_alleys, form_factors) {
+  games <- games %>% filter(Sezona=="22/23", Datum < datum)
+  games_players_with_subs <- left_join(games, players, 
+                              by=c("ID_ut"="ID_ut")) %>% 
+    select(-Kolo:-Lista_P,-Početak, -Kraj) %>% 
+    merge(., teams, 
+          by.x=c("Gost", "ID_ut"), 
+          by.y=c("Gost", "ID_ut"), 
+          select=c(players, teams$Klub), 
+          suffixes = c("", "_b"), 
+          all.x=TRUE) %>% 
+    select(-Pr_b:-Vrijeme_unosa) %>% 
+    select(ID_ut:Igrač, Klub, Gost, Poz:P)
+  
+  games_players <- subset(games_players_with_subs, !str_detect(games_players_with_subs$Igrač,"/" ))
+  
+  home_teams <- filter(teams, Gost == "D", Vrijeme_unosa <= datum)
+  away_teams <- filter(teams, Gost == "G", Vrijeme_unosa <= datum)
+  
+  games_teams <- inner_join(home_teams, away_teams, 
+                            by=c("ID_ut"="ID_ut"), 
+                            suffix=c("_D","_G")) %>% 
+    left_join(games, ., by=c("ID_ut"="ID_ut")) %>% 
+    select(-Kolo:-Lista_P,-Početak:-Kraj,-Vrijeme_unosa_D,-Vrijeme_unosa_G)
+  
+  #Određivanje faktora za kuglane:
+  
+  player_avg_long <- games_players %>% 
+    select(Igrač, Kuglana, Uk) %>% 
+    aggregate(Uk ~ Igrač + Kuglana, mean) %>% 
+    arrange(Igrač)
+  player_avg_wide <- pivot_wider(player_avg_long, 
+                                 names_from = Kuglana, 
+                                 values_from = Uk)
+  
+  
+  #Utakmice sljedećeg kola:
+  
+  next_fixture <- schedule %>% 
+    filter(Datum == datum) %>% 
+    filter(Kolo == min(Kolo)) %>% 
+    inner_join(., bowling_alleys) %>% 
+    arrange(Kolo, Br_ut) %>% 
+    select(ID_ut:Kuglana, Faktor_kuglane)
+  
+  next_fixture_long <- next_fixture %>% 
+    pivot_longer(., Domaćin:Gost, values_to = "Klub")
+  
+  player_clubs <- games_players %>% 
+    select(Igrač, Klub) %>% 
+    unique() %>% 
+    arrange(Klub)
+  
+  broj_odigranih <- games_players %>% 
+    select(Igrač, Datum, Klub) %>%
+    filter(Datum <= datum) %>% 
+    arrange(Igrač) %>% 
+    count(Igrač) %>% 
+    rename(Odigrano = n) %>% 
+    inner_join(., player_clubs)
+  Kolo <- min(next_fixture$Kolo)
+  broj_odigranih$Odigrano <- 1.0 * broj_odigranih$Odigrano / (Kolo-1)
+  
+  #Računanje standardiziranih rezultata za sve nastupe:
+  
+  std_results <- inner_join(games_players, bowling_alleys) %>%
+    select(ID_ut:Klub, Uk, Faktor_kuglane) %>% 
+    mutate(., Std_uk = Uk/Faktor_kuglane)
+  
+  std_results_avg <- aggregate(std_results, Std_uk~Igrač, mean)
+  
+  std_results_avg <- std_results_avg %>% 
+    inner_join(., player_clubs) %>% 
+    select(Igrač, Klub, Std_uk)
+  
+  std_results_avg <- inner_join(std_results_avg, next_fixture_long)
+  std_results_avg <- std_results_avg %>% 
+    inner_join(., broj_odigranih) %>% 
+    filter(Odigrano >= 0.25) %>% 
+    select(Igrač:Std_uk, Kuglana, Faktor_kuglane)
+  
+  
+  #Filtriranje nastupa u proteklih 28 dana i sortiranje po tjednima:
+  
+  games_last_28_days <- std_results %>%
+    select(Igrač, Datum, Std_uk) %>% 
+    mutate(Datum = ymd(Datum)) %>%
+    mutate(days_since_last_game = 
+             as.numeric(difftime(datum, Datum, units = "days"))) %>%
+    mutate(interval = cut(days_since_last_game, 
+                          breaks = c(0, 7, 14, 21, 28), 
+                          labels = c("Week1", "Week2", "Week3","Week4"))) %>%
+    group_by(Igrač, interval) %>%
+    summarise(prosjek = mean(Std_uk)) %>%
+    ungroup()
+  
+  # dodavanje dodatnog kako bi mogao napraviti pivot wider bez gresaka
+  games_last_28_days <- rbind(
+    games_last_28_days,
+    data.frame(Igrač="Igralec1", interval="Week1", prosjek=NA),
+    data.frame(Igrač="Igralec1", interval="Week2", prosjek=NA),
+    data.frame(Igrač="Igralec1", interval="Week3", prosjek=NA),
+    data.frame(Igrač="Igralec1", interval="Week4", prosjek=NA))
+  games_last_28_days <- games_last_28_days %>% 
+    pivot_wider(names_from = interval, values_from = prosjek)
+  games_last_28_days <- games_last_28_days %>% 
+    select(Igrač, Week1, Week2, Week3, Week4)
+  
+  
+  #Određivanje faktora forme ovisno o broju utakmica:
+
+  form <- left_join(std_results_avg, games_last_28_days)
+  form$Igrao_je <- rowSums(!is.na(form[c("Week1", "Week2", "Week3", "Week4")]))
+  
+  form$Week1 <- round(form$Week1 / form$Std_uk, 5)
+  form$Week2 <- round(form$Week2 / form$Std_uk, 5)
+  form$Week3 <- round(form$Week3 / form$Std_uk, 5)
+  form$Week4 <- round(form$Week4 / form$Std_uk, 5)
+  
+  form$zbroj <- 0
+  form$zbroj_koeficijenata <- 0
+  
+  form$zbroj <- form$zbroj +
+    ifelse(!is.na(form$Week1), form$Week1 * form_factors[1], 0) +
+    ifelse(!is.na(form$Week2), form$Week2 * form_factors[2], 0) +
+    ifelse(!is.na(form$Week3), form$Week3 * form_factors[3], 0) +
+    ifelse(!is.na(form$Week4), form$Week4 * form_factors[4], 0)
+  
+  form$zbroj_koeficijenata <- form$zbroj_koeficijenata +
+    ifelse(!is.na(form$Week1), form_factors[1], 0) +
+    ifelse(!is.na(form$Week2), form_factors[2], 0) +
+    ifelse(!is.na(form$Week3), form_factors[3], 0) +
+    ifelse(!is.na(form$Week4), form_factors[4], 0)
+  
+  form$Faktor_forme <- ifelse(form$zbroj_koeficijenata != 0, (form$zbroj / form$zbroj_koeficijenata), 1.000)
+  
+  form$Faktor_forme <- ifelse(form$Faktor_forme < 1, (form$Faktor_forme-1)/form_factors[5]+1, (form$Faktor_forme-1)*form_factors[5]+1)
+  #Dataframe sa svim podacima potrebnima za izračun procjene rezultata:
+  
+  final <- form %>% 
+    select(Igrač, Klub, Std_uk, Kuglana, Faktor_kuglane, Faktor_forme)
+  
+  final$Rezultat <- round(final$Std_uk * 
+                            final$Faktor_kuglane * 
+                            final$Faktor_forme, 2)
+  final$Datum <- datum
+  
+  print_final <- final %>% arrange(Klub, Igrač) %>% select(Igrač, Datum, Rezultat)
+  #return(final)
+  return(final)
+}
+
+alley_factors <- function(games, players, teams, schedule, datum) {
+  games_players_with_subs <- left_join(games, players, 
+                            by=c("ID_ut"="ID_ut")) %>% 
+  select(-Kolo:-Lista_P,-Početak, -Kraj) %>% 
+  merge(., teams, 
+        by.x=c("Gost", "ID_ut"), 
+        by.y=c("Gost", "ID_ut"), 
+        select=c(players, teams$Klub), 
+        suffixes = c("", "_b"), 
+        all.x=TRUE) %>% 
+  select(-Pr_b:-Vrijeme_unosa) %>% 
+  select(ID_ut:Igrač, Klub, Gost, Poz:P)
+
+  games_players <- subset(games_players_with_subs, !str_detect(games_players_with_subs$Igrač,"/" ))
+
+  home_teams <- filter(teams, Gost == "D", Vrijeme_unosa <= datum)
+  away_teams <- filter(teams, Gost == "G", Vrijeme_unosa <= datum)
+
+  games_teams <- inner_join(home_teams, away_teams, 
+                          by=c("ID_ut"="ID_ut"), 
+                          suffix=c("_D","_G")) %>% 
+  left_join(games, ., by=c("ID_ut"="ID_ut")) %>% 
+  select(-Kolo:-Lista_P,-Početak:-Kraj,-Vrijeme_unosa_D,-Vrijeme_unosa_G)
+
+#Određivanje faktora za kuglane:
+
+  player_avg_long <- games_players %>% 
+    select(Igrač, Kuglana, Uk) %>% 
+    aggregate(Uk ~ Igrač + Kuglana, mean) %>% 
+    arrange(Igrač)
+  player_avg_wide <- pivot_wider(player_avg_long, 
+                                 names_from = Kuglana, 
+                                 values_from = Uk)
+  
+  bowling_alleys <- aggregate(Uk~Kuglana, data=player_avg_long, mean) %>% 
+    rename(Prosjek=Uk)
+  bowling_alleys$Faktor_kuglane <- round(bowling_alleys$Prosjek / max(bowling_alleys$Prosjek),3)
+  bowling_alleys$Grad <- c("Bjelovar", "Zagreb", "Plitvička Jezera", "Zadar", "Osijek", "Split", "Đurđenovac", "Čakovec", "Zaprešić")
+  bowling_alleys <- bowling_alleys %>% select(Grad, Kuglana, Prosjek, Faktor_kuglane)
+  return(bowling_alleys)
+}
+
+extract_dates <- function(games) {
+  dates <- unique(games$Datum) %>% as.character() %>% sort()
+  return(dates)
+}
+
+mistake <- function(predictions, players) {
+  datum <- predictions$Datum
+  players <- players %>% filter(Datum == datum)
+  compare <- inner_join(predictions, players, by="Igrač") %>% select(Igrač, Rezultat, Uk)
+  compare <- subset(compare, !str_detect(compare$Igrač,"/" ))
+  compare$deviation <- abs(compare$Rezultat-compare$Uk)
+  #error <- mean(compare$deviation)
+  return(compare)
+}
+
+```
+
+```{r}
+
+bowling_alleys <- alley_factors(games, players, teams, schedule, dmy("26-03-2023"))
+datumi <- extract_dates(games)
+train_set <- c()
+test_set <- c()
+for (datum in datumi) {
+  ifelse(year(ymd(datum)) == 2022, train_set <- c(train_set, datum), test_set <- c(test_set, datum))
+}
+
+
+set.seed(123)
+random <- list()
+for (i in 1:200) {
+  random_brojevi <- c(sample(seq(1, 5, 0.5), 4), sample(30:60, 1))
+  random_brojevi[5] <- random_brojevi[5]/50
+  random[[i]] <- as.numeric(random_brojevi)
+}
+
+#random
+#rezultati <- predictions(games, players, teams, schedule, dmy("18-03-2023"), bowling_alleys, c(0.35, 0.25, 0.25, 0.15, 0.90))
+#greska <- mistake(rezultati, results)
+#greska
+
+
+best <- 999999
+index <- 0
+errors <- c()
+for (i in seq(1:length(random))){
+  print(i)
+  error <- c()
+  for(datum in train_set[3:length(train_set)]){
+    prediction <- predictions(games, players, teams, schedule, ymd(datum), bowling_alleys, random[[i]])
+    error <- rbind(error, mistake(prediction, results))
+  }
+  if(mean(error$deviation)<best) {
+    best <- mean(error$deviation)
+    index <- as.integer(i)
+  }
+  errors <- c(errors, mean(error$deviation))
+}
+errors
+best
+
+```
+
+```{r}
+form_factors <- random[[index]]
+
+train_error <- c()
+train_data <- c()
+for(datum in train_set[3:length(train_set)]){
+    prediction <- predictions(games, players, teams, schedule, ymd(datum), bowling_alleys, random[[i]])
+    curr_error <- mistake(prediction, results)
+    train_data <- rbind(train_data, curr_error)
+    train_error <- c(train_error, mean(curr_error$deviation))
+}
+train_error
+mean(train_data$deviation)
+
+```
+
+```{r}
+
+test_data <- c()
+test_error <- c()
+prediction <- c()
+for(datum in test_set[1:length(test_set)]){
+  prediction <- predictions(games, players, teams, schedule, ymd(datum), bowling_alleys, form_factors)
+  curr_error <- mistake(prediction, results)
+  test_data <- rbind(test_data, mistake(prediction, results))
+  test_error <- c(test_error, mean(curr_error$deviation))
+}
+test_error
+mean(test_data$deviation)
+
+
+```
+```{r}
+
+#Određivanje parova za izračun rezultata:
+
+permutacije <- permutations(n = 6, r = 6, v = 1:6)
+parovi <- {}
+for (i in 1:720) {
+  parovi <- rbind(parovi, cbind.data.frame(permutacije[i], 
+                                           permutacije[i+720], 
+                                           permutacije[i+1440], 
+                                           permutacije[i+2160], 
+                                           permutacije[i+2880], 
+                                           permutacije[i+3600]))
+}
+names(parovi) <- c("A", "B", "C", "D", "E", "F")
+
+team_winner <- function(final, schedule, bowling_alleys, datum) {
+  next_fixture <- schedule %>%
+    filter(Datum == datum) %>% 
+    inner_join(., bowling_alleys) %>% 
+    arrange(Kolo, Br_ut) %>% 
+    select(ID_ut:Kuglana, Faktor_kuglane)
+    
+  team_1H <- final %>% 
+    filter(Klub == nth(next_fixture$Domaćin, 1)) %>% 
+    arrange(desc(Rezultat)) %>% head(6) %>% select(Igrač, Klub, Rezultat) %>% 
+    rename(Igrač_H = Igrač, Klub_H = Klub, Rezultat_H = Rezultat) %>% 
+    mutate(Rezultat_H = round(Rezultat_H))
+  team_1G <- final %>% 
+    filter(Klub == nth(next_fixture$Gost, 1)) %>% 
+    arrange(desc(Rezultat)) %>% head(6) %>% select(Igrač, Klub, Rezultat) %>% 
+    rename(Igrač_G = Igrač, Klub_G = Klub, Rezultat_G = Rezultat) %>% 
+    mutate(Rezultat_G = round(Rezultat_G))
+  
+  game1 <- cbind(team_1H, team_1G)
+  game1_team <-  data.frame(cbind(team_1H$Klub, sum(team_1H$Rezultat), 
+                                  team_1G$Klub, sum(team_1G$Rezultat))) %>% 
+    unique() %>% rename(Klub_H=X1, Klub_G=X3, Rezultat_H=X2, Rezultat_G=X4)
+  
+  h_uk <- 0
+  x_uk <- 0
+  g_uk <- 0
+  h <- 0
+  g <- 0
+  for(i in 1:nrow(parovi)) {
+    igrac1 <- team_1G$Rezultat_G[parovi[i, 1]]
+    igrac2 <- team_1G$Rezultat_G[parovi[i, 2]]
+    igrac3 <- team_1G$Rezultat_G[parovi[i, 3]]
+    igrac4 <- team_1G$Rezultat_G[parovi[i, 4]]
+    igrac5 <- team_1G$Rezultat_G[parovi[i, 5]]
+    igrac6 <- team_1G$Rezultat_G[parovi[i, 6]]
+    
+    ifelse(team_1H$Rezultat_H[1] == igrac1, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[1] > igrac1, h <- h+1, g <- g+1))
+    ifelse(team_1H$Rezultat_H[2] == igrac2, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[2] > igrac2, h <- h+1, g <- g+1))
+    ifelse(team_1H$Rezultat_H[3] == igrac3, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[3] > igrac3, h <- h+1, g <- g+1))
+    ifelse(team_1H$Rezultat_H[4] == igrac4, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[4] > igrac4, h <- h+1, g <- g+1))
+    ifelse(team_1H$Rezultat_H[5] == igrac5, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[5] > igrac5, h <- h+1, g <- g+1))
+    ifelse(team_1H$Rezultat_H[6] == igrac6, {h <- h+0.5; g <- g+0.5}, 
+           ifelse(team_1H$Rezultat_H[6] > igrac6, h <- h+1, g <- g+1))
+  
+    ifelse(abs(as.numeric(game1_team$Rezultat_H) - 
+                 as.numeric(game1_team$Rezultat_G)) < 20, 
+           {h <- h+1; g <- g+1},
+           ifelse(game1_team$Rezultat_H > game1_team$Rezultat_G, 
+                  h <- h+2, g <- g+2))
+    
+    ifelse(h == g, x_uk <- x_uk+1, 
+           ifelse(h>g, h_uk <- h_uk+1, g_uk <- g_uk+1))
+    h <- 0
+    g <- 0
+  }
+  
+  game1_result <- data.frame(game1_team$Klub_H, game1_team$Klub_G, NA, NA)
+  names(game1_result) <- c("Domaćin", "Gost", "Pobjednik", "Vjerojatnost")
+  
+  ifelse((x_uk > h_uk & x_uk > g_uk), 
+         {pobjednik <- "neriješeno"; sanse <- x_uk/720},
+         ifelse(h_uk == g_uk, 
+                {pobjednik <- "neriješeno"; sanse <- 0.5},
+                ifelse(h_uk > g_uk, 
+                       {pobjednik <- game1_result$Domaćin; sanse <- h_uk/720},
+                       {pobjednik <- game1_result$Gost; sanse <- g_uk/720})))
+  game1_result$Pobjednik <- pobjednik
+  game1_result$Vjerojatnost <- round(sanse,2)
+  game1_result$HomeWins <- h_uk
+  game1_result$Draws <- x_uk
+  game1_result$AwayWins <- g_uk
+
+  return(game1_result)
+}
+
+```
+
+```{r}
+
+next_games <- function(schedule, datum, bowling_alleys) {
+  next_fixture <- schedule %>% 
+    filter(Datum == datum) %>% 
+    inner_join(., bowling_alleys) %>% 
+    arrange(Kolo, Br_ut) %>% 
+    select(ID_ut:Kuglana, Faktor_kuglane)
+  return(next_fixture)
+}
+
+test_winners <- c()
+for(datum in test_set[1:length(test_set)]){
+  prediction <- predictions(games, players, teams, schedule, ymd(datum), bowling_alleys, form_factors)
+  new_ones <- c()
+  new_ones <- next_games(schedule, ymd(datum), bowling_alleys)
+  for(i in seq(1:nrow(new_ones))) {
+    winners <- team_winner(prediction, new_ones[i,], bowling_alleys, ymd(datum))
+    test_winners <- rbind(test_winners, winners)
+  }
+}
+test_winners
+
+```
